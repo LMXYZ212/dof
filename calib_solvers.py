@@ -48,7 +48,7 @@ class CalibrationSolverIpopt:
             
             for i in range(6):
                 c0_idx = i * num_params_per_ax + 6
-                if err_switch[i][j] != 0:
+                if err_switch[i][6] != 0:
                   
                     opti.subject_to(x[c0_idx] >= 1e-12)
                     opti.subject_to(x[c0_idx] <= 6.45161e-05)
@@ -165,7 +165,7 @@ class CalibrationSolverIpopt:
             
             for i in range(6):
                 c0_idx = i * num_params_per_ax + 6
-                if err_switch[i][j] != 0:
+                if err_switch[i][6] != 0:
                     
                     opti.subject_to(x[c0_idx] >= 1e-12)
                     opti.subject_to(x[c0_idx] <= 6.45161e-05)
@@ -335,7 +335,7 @@ class CalibrationSolverIpopt:
             
             for i in range(6):
                 c0_idx = i * num_params_per_ax + 6
-                if err_switch[i][j] != 0:
+                if err_switch[i][6] != 0:
                     
                     opti.subject_to(x[c0_idx] >= 1e-12)
                     opti.subject_to(x[c0_idx] <= 6.45161e-05)
@@ -399,118 +399,291 @@ class CalibrationSolverIpopt:
     
 
 
-    def solve_calibration_pi(
-        self,
-        model: CalibrationModel,
-        q: np.ndarray,
-        meas: np.ndarray,
-        comp_model: str,
-        initial_err: np.ndarray,        # ← 原误差参数初值
-        initial_wpi: np.ndarray,        # ← PI 权重初值
-        lock_err: bool = False          # True=锁死误差，仅优 w_pi
-    ):
-        """单数据集 + PI 权重   （不改老函数）"""
-        # ----------- 准备维度 -----------
-        err_switch = model.get_error_par_switch()
-        num_ax = len(err_switch)
-        num_params_per_ax = len(err_switch[0])
-        n_err = num_ax * num_params_per_ax
-
-        # 统计 PI 维度
-        n_wpi = sum(len(model.pi_beta[j]) for j in range(6))
-
-        # ----------- IPOPT -----------
-        opti = cs.Opti()
-        err_param = opti.variable(n_err)
-        w_pi      = opti.variable(n_wpi)
-
-        fk = model.get_symbolic_meas_fct()
-        cost = 0.0
-        for qi, mi in zip(q, meas):
-            q_hat = model.get_corrected_q(cs.SX(qi), w_pi)
-            cost += cs.sumsqr(fk(q_hat, err_param) - mi)
-        opti.minimize(cost)
-
-        # 误差锁
-        if lock_err:
-            opti.subject_to(err_param == initial_err)
-
-        else:
-            for i in range(num_ax):
-                for j in range(num_params_per_ax):
-                    if not err_switch[i][j]:
-                        idx = i*num_params_per_ax + j
-                        opti.subject_to(err_param[idx] == initial_err[idx])
-
-        # 未启用轴的 w_pi 直接锁 0
-        idx = 0
-        for j in range(6):
-            for _ in model.pi_beta[j]:
-                if not model.pi_enabled[j]:
-                    opti.subject_to(w_pi[idx] == 0)
-                idx += 1
-
-        # 初值
-        opti.set_initial(err_param, initial_err)
-        opti.set_initial(w_pi, initial_wpi)
-
-        opti.solver("ipopt", {}, {"print_level":0,"max_iter":2000,"linear_solver":"mumps"})
-        sol = opti.solve()
-        return np.r_[sol.value(err_param), sol.value(w_pi)]
-
 # ----------------------------------------------------------------
     def solve_double_calibration_pi(
-        self,
-        model_high: CalibrationModel,
-        model_low : CalibrationModel,
-        q_high, meas_high,
-        q_low , meas_low,
-        comp_model: str,
-        initial_err: np.ndarray,
-        initial_wpi: np.ndarray,
-        lock_err: bool = False
-    ):
-        """双数据集 + PI 权重   （不改老函数）"""
+            self,
+            model_high: CalibrationModel,
+            model_low : CalibrationModel,
+            q_high, dq_high, meas_high,
+            q_low , dq_low , meas_low,
+            comp_model: str,
+            initial_err: np.ndarray,
+            initial_wpi_high: np.ndarray,
+            initial_wpi_low : np.ndarray,
+            lock_err: bool = False
+        ):
         err_switch = model_high.get_error_par_switch()
         num_ax = len(err_switch)
         num_params_per_ax = len(err_switch[0])
         n_err = num_ax * num_params_per_ax
-        n_wpi = sum(len(model_high.pi_beta[j]) for j in range(6))
+        n_wpi_high = sum(len(model_high.pi_beta[j]) for j in range(6))
+        n_wpi_low  = sum(len(model_low.pi_beta[j]) for j in range(6))
 
         opti = cs.Opti()
-        err_param = opti.variable(n_err)
-        w_pi      = opti.variable(n_wpi)
+        x = opti.variable(n_err)
+        w_pi_high = opti.variable(n_wpi_high)
+        w_pi_low  = opti.variable(n_wpi_low)
 
         fk_h = model_high.get_symbolic_meas_fct()
         fk_l = model_low .get_symbolic_meas_fct()
+
         cost = 0
-        for qh, mh in zip(q_high, meas_high):
-            qh_hat = model_high.get_corrected_q(cs.MX(qh), w_pi)
-            cost += cs.sumsqr(fk_h(qh_hat, err_param) - mh)
-        for ql, ml in zip(q_low, meas_low):
-            ql_hat = model_low.get_corrected_q(cs.MX(ql), w_pi)
-            cost += cs.sumsqr(fk_l(ql_hat, err_param) - ml)
+        for qh, dqh, mh in zip(q_high, dq_high, meas_high):
+            qh_hat = model_high.get_corrected_q(cs.MX(qh), cs.MX(dqh), w_pi_high)
+            cost += cs.sumsqr(fk_h(qh_hat, x) - mh)
+
+        for ql, dql, ml in zip(q_low, dq_low, meas_low):
+            ql_hat = model_low.get_corrected_q(cs.MX(ql), cs.MX(dql), w_pi_low)
+            cost += cs.sumsqr(fk_l(ql_hat, x) - ml)
+
         opti.minimize(cost)
 
-        # 锁定逻辑与上面同
+        # 误差参数锁定逻辑不变
         if lock_err:
-            opti.subject_to(err_param == initial_err)
+            opti.subject_to(x == initial_err)
         else:
             for i in range(num_ax):
                 for j in range(num_params_per_ax):
                     if not err_switch[i][j]:
-                        idx = i*num_params_per_ax + j
-                        opti.subject_to(err_param[idx] == initial_err[idx])
+                        idx = i * num_params_per_ax + j
+                        opti.subject_to(x[idx] == initial_err[idx])
 
+        # 高负载 π 权重锁定
         idx = 0
         for j in range(6):
             for _ in model_high.pi_beta[j]:
                 if not model_high.pi_enabled[j]:
-                    opti.subject_to(w_pi[idx] == 0)
+                    opti.subject_to(w_pi_high[idx] == 0)
                 idx += 1
 
-        opti.set_initial(err_param, initial_err)
-        opti.set_initial(w_pi, initial_wpi)
-        opti.solver("ipopt", {}, {"print_level":0,"max_iter":2000,"linear_solver":"mumps"})
+        # 低负载 π 权重锁定
+        idx = 0
+        for j in range(6):
+            for _ in model_low.pi_beta[j]:
+                if not model_low.pi_enabled[j]:
+                    opti.subject_to(w_pi_low[idx] == 0)
+                idx += 1
+
+        # 柔顺性约束不变（使用 x）
+        if num_params_per_ax > 6:
+            sample_taus = [x for x in range(-150, 151, 5) if x != 0]
+            for i in range(6):
+                c0_idx = i * num_params_per_ax + 6
+                if err_switch[i][6] != 0:
+                    opti.subject_to(x[c0_idx] >= 1e-12)
+                    opti.subject_to(x[c0_idx] <= 6.45161e-05)
+
+                    if comp_model in ['Quad', 'Cubic']:
+                        opti.subject_to(x[c0_idx+1] <= 5e-05)
+                        opti.subject_to(x[c0_idx+1] >= -5e-05)
+                        for tau in sample_taus:
+                            der_quad = x[c0_idx] + 2 * 1e-2 * abs(tau) * cs.fabs(x[c0_idx+1])
+                            opti.subject_to(der_quad >= 1e-9)
+
+                            second_der_quad = 2 * 1e-2 * x[c0_idx+1] * cs.sign(tau)
+                            opti.subject_to(second_der_quad <= 0)
+
+                        if comp_model == 'Cubic':
+                            opti.subject_to(x[c0_idx+2] <= 5e-05)
+                            opti.subject_to(x[c0_idx+2] >= -5e-05)
+                            for tau in sample_taus:
+                                der_cubic = (
+                                    x[c0_idx]
+                                    + 2 * 1e-2 * abs(tau) * cs.fabs(x[c0_idx+1])
+                                    + 3 * 1e-4 * (tau ** 2) * x[c0_idx+2]
+                                )
+                                opti.subject_to(der_cubic >= 0)
+
+                                second_der_cubic = (
+                                    2 * 1e-2 * x[c0_idx+1] * cs.sign(tau)
+                                    + 6 * 1e-4 * tau * x[c0_idx+2]
+                                )
+                                opti.subject_to(second_der_cubic <= 0)
+
+        # 初始化
+        opti.set_initial(x, initial_err)
+        opti.set_initial(w_pi_high, initial_wpi_high)
+        opti.set_initial(w_pi_low , initial_wpi_low)
+
+        opti.solver("ipopt", {}, {
+            "print_level": 0,
+            "max_iter": 2000,
+            "linear_solver": "mumps"
+        })
+
         sol = opti.solve()
-        return np.r_[sol.value(err_param), sol.value(w_pi)]
+        return np.r_[sol.value(x), sol.value(w_pi_high), sol.value(w_pi_low)]
+    
+    
+    def solve_joint_comp_pi(
+            self,
+            model_high: CalibrationModel,
+            model_low : CalibrationModel,
+            q_high, dq_high, meas_high, 
+            q_low , dq_low , meas_low , 
+            comp_model: str,
+            initial_guess: np.ndarray,
+            initial_wpi_high: np.ndarray,
+            initial_wpi_low : np.ndarray,
+            lambda_intra: float = 5.0,
+            lambda_inter: float = 2.0,
+            lambda_abs  : float = 1.0,
+            group_len: int = 120,
+            lock_err: bool = False
+        ):
+        """
+        联合优化：几何 + 柔顺 + PI(高/低载)
+        - group_len: 用于确定“同一 q 出现在不同 120 组”的窗口
+        """
+        # ---------- 维度 ----------
+        err_switch = model_high.get_error_par_switch()
+        num_ax = len(err_switch)
+        geom_param = 6
+        nC = {"Lin":1, "Quad":2, "Cubic":3}[comp_model]
+        num_params_per_ax = geom_param + nC
+        n_err       = num_ax * num_params_per_ax
+        n_wpi_high  = sum(len(model_high.pi_beta[j]) for j in range(6))
+        n_wpi_low   = n_wpi_high
+
+        # ---------- Opti ----------
+        opti = cs.Opti()
+        x           = opti.variable(n_err)
+        w_pi_high   = opti.variable(n_wpi_high)
+        w_pi_low    = opti.variable(n_wpi_low)
+
+        fk_h = model_high.get_symbolic_meas_fct()
+        fk_l = model_low .get_symbolic_meas_fct()
+        cost = 0
+
+        # ------------------------------------------------------------
+        # 1) 绝对定位 cost_abs  (高、低各加一次)
+        # ------------------------------------------------------------
+        for qh, dqh, mh in zip(q_high, dq_high, meas_high):
+            qh_hat = model_high.get_corrected_q(cs.MX(qh), cs.MX(dqh), w_pi_high)
+            cost  += lambda_abs * cs.sumsqr(fk_h(qh_hat, x) - mh)
+
+        for ql, dql, ml in zip(q_low, dq_low, meas_low):
+            ql_hat = model_low.get_corrected_q(cs.MX(ql), cs.MX(dql), w_pi_low)
+            cost  += lambda_abs * cs.sumsqr(fk_l(ql_hat, x) - ml)
+
+        # ------------------------------------------------------------
+        # 2) 高 vs 低 差异 cost_inter
+        # ------------------------------------------------------------
+        for qh, dqh, ql, dql, mh, ml in zip(q_high, dq_high, q_low, dq_low, meas_high, meas_low):
+            qh_hat = model_high.get_corrected_q(cs.MX(qh), cs.MX(dqh), w_pi_high)
+            ql_hat = model_low .get_corrected_q(cs.MX(ql), cs.MX(dql), w_pi_low )
+            tcp_h  = fk_h(qh_hat, x)
+            tcp_l  = fk_l(ql_hat, x)
+            delta_pred  = tcp_h - tcp_l
+            delta_meas  = mh     - ml
+            cost += lambda_inter * cs.sumsqr(delta_pred - delta_meas)
+            cost += lambda_inter * cs.sumsqr(cs.sumsqr(delta_pred) - cs.sumsqr(delta_meas))
+
+        # ------------------------------------------------------------
+        # 3) 组内迟滞 cost_intra
+        # ------------------------------------------------------------
+        def add_intra_cost(q_arr, dq_arr, meas_arr, model, w_pi_var):
+            nonlocal cost
+            # 先离线找相同 q 的索引对（Python 侧）
+            from collections import defaultdict
+            bucket = defaultdict(list)
+            for idx, q in enumerate(q_arr):
+                bucket[tuple(q)].append(idx)
+
+            for idx_list in bucket.values():
+                if len(idx_list) < 2:
+                    continue
+                # 每组内部两两组合
+                for ii in range(len(idx_list)):
+                    for jj in range(ii+1, len(idx_list)):
+                        k, m = idx_list[ii], idx_list[jj]
+                        qi, dqi, mi = q_arr[k], dq_arr[k], meas_arr[k]
+                        qj, dqj, mj = q_arr[m], dq_arr[m], meas_arr[m]
+
+                        q_hat_i = model.get_corrected_q(cs.MX(qi), cs.MX(dqi), w_pi_var)
+                        q_hat_j = model.get_corrected_q(cs.MX(qj), cs.MX(dqj), w_pi_var)
+                        tcp_i   = fk_h(q_hat_i, x) if model is model_high else fk_l(q_hat_i, x)
+                        tcp_j   = fk_h(q_hat_j, x) if model is model_high else fk_l(q_hat_j, x)
+
+                        delta_pred = tcp_i - tcp_j
+                        delta_meas = mi     - mj
+                        cost += lambda_intra * cs.sumsqr(delta_pred - delta_meas)
+                        cost += lambda_intra * cs.sumsqr(cs.sumsqr(delta_pred) - cs.sumsqr(delta_meas))
+
+        # 对高载、低载各加一次组内 cost
+        add_intra_cost(q_high, dq_high, meas_high, model_high, w_pi_high)
+        add_intra_cost(q_low , dq_low , meas_low , model_low , w_pi_low )
+
+        # ---------- 目标 ----------
+        opti.minimize(cost)
+
+        # ---------- 约束（几何锁定 / π 禁用轴 = 0 / 柔顺单调） ----------
+        
+        for j in range(num_ax):
+           
+            for g in range(geom_param):
+                if not err_switch[j][g]:
+                    opti.subject_to(x[j*num_params_per_ax + g] == initial_guess[j*num_params_per_ax + g])
+         
+            for k in range(nC):
+                local_idx = geom_param + k
+                if not err_switch[j][local_idx]:
+                    opti.subject_to(x[j*num_params_per_ax + local_idx] == initial_guess[j*num_params_per_ax + local_idx])
+
+        # C1 > 0
+        # for j in range(6):
+        #     opti.subject_to(x[j*num_params_per_ax + geom_param] > 1e-12)
+
+        # Restrict the first-order derivative of the compliance curve to be greater than 0 
+        # and the second-order derivative to be less than 0
+        if num_params_per_ax > 6:
+            sample_taus = sample_taus = [x for x in range(-150, 151, 5) if x != 0]
+            
+            for i in range(6):
+                c0_idx = i * num_params_per_ax + 6
+                if err_switch[i][6] != 0:
+                    
+                    opti.subject_to(x[c0_idx] >= 1e-12)
+                    opti.subject_to(x[c0_idx] <= 6.45161e-05)
+
+                    if comp_model == 'Quad' or comp_model == 'Cubic':
+                        opti.subject_to(x[c0_idx+1] <= 5e-05)
+                        opti.subject_to(x[c0_idx+1] >= -5e-05)
+
+                        
+                        for tau in sample_taus:
+                            der_quad = x[c0_idx] + 2 * 1e-2 * abs(tau) * cs.fabs(x[c0_idx+1])
+                            opti.subject_to(der_quad >= 0.000000001)
+
+                        
+                        for tau in sample_taus:
+                            second_der_quad = 2 * 1e-2 * x[c0_idx+1] * cs.sign(tau)
+                            opti.subject_to(second_der_quad <= 0)
+
+                        if comp_model == 'Cubic':
+                            opti.subject_to(x[c0_idx+2] <= 5e-05)
+                            opti.subject_to(x[c0_idx+2] >= -5e-05)
+
+                            
+                            for tau in sample_taus:
+                                der_cubic = (
+                                    x[c0_idx]
+                                    + 2 * 1e-2 * abs(tau) * cs.fabs(x[c0_idx+1])
+                                    + 3 * 1e-4 * (tau ** 2) * x[c0_idx+2]
+                                )
+                                opti.subject_to(der_cubic >= 0)
+
+                            
+                            for tau in sample_taus:
+                                second_der_cubic = (
+                                    2 * 1e-2 * x[c0_idx+1] * cs.sign(tau)
+                                    + 6 * 1e-4 * tau * x[c0_idx+2]
+                                )
+                                opti.subject_to(second_der_cubic <= 0)
+        # ---------- 初始化 & 求解 ----------
+        opti.set_initial(x, initial_guess)
+        opti.set_initial(w_pi_high, initial_wpi_high)
+        opti.set_initial(w_pi_low , initial_wpi_low )
+        opti.solver("ipopt", {}, {"print_level":0,"max_iter":5000,"linear_solver":"mumps"})
+        sol = opti.solve()
+        return np.r_[sol.value(x), sol.value(w_pi_high), sol.value(w_pi_low)]
