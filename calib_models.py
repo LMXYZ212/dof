@@ -122,41 +122,42 @@ class CalibrationModel6RComplNl(CalibrationModel):
         # 强制 x 是 MX 类型，避免传入 SX
         x = cs.MX(x)
         cond = cs.fabs(x) <= beta
-        out1 = cs.MX(0)
-        out2 = cs.sign(x) * (cs.fabs(x) - beta)
+        out1 = x
+        out2 = cs.sign(x) * beta
         return cs.if_else(cond, out1, out2)
 
 # ================================================================
 #  ③  返回 PI-校正后的关节角向量 q̂
 # ================================================================
-    def get_corrected_q(self, q_in: cs.SX, w_pi: cs.SX):
+    def get_corrected_q(self,
+                        q_in: cs.SX,          # 6×1  绝对关节角
+                        dq_in: cs.SX,         # 6×1  增量 Δq = q[k]-q[k-1]
+                        w_pi: cs.SX):         # N×1  PI 权重
         """
-        参数
-        -------
-        q_in : 6×1  CasADi SX / MX   —— 原始关节角
-        w_pi : N×1  CasADi SX / MX   —— 按关节顺序拼接的权重
-                                         N = Σ_j len(pi_beta[j])
-
-        返回值
-        -------
-        q_corr : 6×1  CasADi 向量，已做 PI 补偿
+        返回 q_corr = q_in - Σ w·play(Δq, β)
         """
         q_corr = []
-        ptr = 0                       # w_pi 读取指针
+        ptr = 0
+
+        # 把 q_in / dq_in 转成 MX，避免 SX+MX 报错
+        q_in_mx  = cs.vertcat(*[q_in[i]  + 0*w_pi[0] for i in range(q_in.numel())])
+        dq_in_mx = cs.vertcat(*[dq_in[i] + 0*w_pi[0] for i in range(dq_in.numel())])
+
         for j in range(6):
-            q_j_mx = q_in[j] + 0*w_pi[0]      # <- 这行确保 q_j_mx 类型是 MX
+            dq_j = dq_in_mx[j]          # MX 标量
+            q_j  = q_in_mx [j]          # MX 标量
 
             if self.pi_enabled[j] and self.pi_beta[j]:
                 hyster = 0
-                for _β in self.pi_beta[j]:
-                    hyster += w_pi[ptr] * self._play_static(q_j_mx, _β)
+                for β in self.pi_beta[j]:
+                    hyster += w_pi[ptr] * self._play_static(dq_j, β)
                     ptr += 1
-                q_corr.append(q_j_mx - hyster)
+                q_corr.append(q_j - hyster)
             else:
-                ptr += len(self.pi_beta[j])   # 跳过对应权重计数
-                q_corr.append(q_j_mx)
+                ptr += len(self.pi_beta[j])
+                q_corr.append(q_j)
 
-        return cs.vertcat(*q_corr)
+        return cs.vertcat(*q_corr)       # 6×1 MX 向量
 
 
     # symbolic functions
